@@ -7,23 +7,24 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/cloudsqlconn"
 	"github.com/go-sql-driver/mysql"
 	"github.com/iancoleman/strcase"
-	"github.com/spf13/cast"
 )
 
 var (
-	logging bool
-	db      *sql.DB
-	wdb     *sql.DB
+	logging     bool
+	readDBOnce  = sync.OnceValue(func() *sql.DB { return initDB(true) })
+	writeDBOnce = sync.OnceValue(func() *sql.DB { return initDB(false) })
 )
 
 // Pls enhance the query by incorporating the 'limit 1' parameter to optimize speed.
-func One[T any](query string, args []interface{}) *T {
+func One[T any](query string, args []any) *T {
 	defer timer(GenerateQueryString(query, args))()
 
 	db := GetDB()
@@ -32,8 +33,6 @@ func One[T any](query string, args []interface{}) *T {
 	defer rows.Close()
 
 	if rows.Next() {
-		// var structData T
-		// mapToStruct(resultToMap(rows), &structData)
 		structData := ScanStruct[T](rows)
 		return &structData
 	} else {
@@ -41,7 +40,7 @@ func One[T any](query string, args []interface{}) *T {
 	}
 }
 
-func All[T any](query string, args []interface{}) []T {
+func All[T any](query string, args []any) []T {
 	defer timer(GenerateQueryString(query, args))()
 
 	db := GetDB()
@@ -51,8 +50,6 @@ func All[T any](query string, args []interface{}) []T {
 
 	var res []T
 	for rows.Next() {
-		// var structData T
-		// mapToStruct(resultToMap(rows), &structData)
 		res = append(res, ScanStruct[T](rows))
 	}
 
@@ -60,7 +57,7 @@ func All[T any](query string, args []interface{}) []T {
 }
 
 // Executes the query and returns the first column of the result
-func Column(query string, args []interface{}, dest ...any) error {
+func Column(query string, args []any, dest ...any) error {
 	defer timer(GenerateQueryString(query, args))()
 
 	db := GetDB()
@@ -70,7 +67,7 @@ func Column(query string, args []interface{}, dest ...any) error {
 }
 
 // ColumnSlice executes the query and returns all values from the first column as a slice
-func ColumnSlice[T any](query string, args []interface{}) ([]T, error) {
+func ColumnSlice[T any](query string, args []any) ([]T, error) {
 	defer timer(GenerateQueryString(query, args))()
 
 	db := GetDB()
@@ -97,7 +94,7 @@ func ColumnSlice[T any](query string, args []interface{}) ([]T, error) {
 }
 
 // Executes the SQL statement and returns ALL rows at once
-func QueryAll(query string, args []interface{}) []map[string]interface{} {
+func QueryAll(query string, args []any) []map[string]any {
 	defer timer(GenerateQueryString(query, args))()
 
 	db := GetDB()
@@ -105,7 +102,7 @@ func QueryAll(query string, args []interface{}) []map[string]interface{} {
 	handleError("Error On Get Rows", err)
 	defer rows.Close()
 
-	var res []map[string]interface{}
+	var res []map[string]any
 	for rows.Next() {
 		res = append(res, resultToMap(rows))
 	}
@@ -115,7 +112,7 @@ func QueryAll(query string, args []interface{}) []map[string]interface{} {
 
 // Deprecated: Unable to close the rows and database connection after the query is completed.
 // This function will retain the database connection in the pool.
-func GetRows(query string, args []interface{}) *sql.Rows {
+func GetRows(query string, args []any) *sql.Rows {
 	defer timer(GenerateQueryString(query, args))()
 
 	db := GetDB()
@@ -125,7 +122,7 @@ func GetRows(query string, args []interface{}) *sql.Rows {
 	return rows
 }
 
-func Exec(query string, args []interface{}) (sql.Result, error) {
+func Exec(query string, args []any) (sql.Result, error) {
 	defer timer(GenerateQueryString(query, args))()
 
 	db := GetDB(false)
@@ -157,18 +154,11 @@ func GetIsLogging() bool {
 func GetDB(readOnly ...bool) *sql.DB {
 	// Use write DB connection if explicitly requested
 	if len(readOnly) > 0 && !readOnly[0] {
-		if wdb == nil {
-			wdb = initDB(false)
-		}
-
-		return wdb
+		return writeDBOnce()
 	}
 
 	// Default to read-only DB connection
-	if db == nil {
-		db = initDB(true)
-	}
-	return db
+	return readDBOnce()
 }
 
 func initDB(readOnly bool) *sql.DB {
@@ -186,11 +176,12 @@ func initDB(readOnly bool) *sql.DB {
 
 		// Use Cloud SQL Connector if configured
 		if cloudSqlInstances := getEnv("DATABASE_READ_INSTANCES"); cloudSqlInstances != "" {
-			if err := registerDial(cloudSqlInstances); err != nil {
+			network := "cloudsqlconn_read"
+			if err := registerDial(cloudSqlInstances, network); err != nil {
 				handleError("cloudsqlconn.NewDialer", err)
 			}
 
-			dbConfig.Net = "cloudsqlconn"
+			dbConfig.Net = network
 			dbConfig.Addr = "localhost:3306"
 		}
 	}
@@ -202,11 +193,12 @@ func initDB(readOnly bool) *sql.DB {
 
 		// Use Cloud SQL Connector if configured
 		if cloudSqlInstances := getEnv("DATABASE_INSTANCES"); cloudSqlInstances != "" {
-			if err := registerDial(cloudSqlInstances); err != nil {
+			network := "cloudsqlconn_write"
+			if err := registerDial(cloudSqlInstances, network); err != nil {
 				handleError("cloudsqlconn.NewDialer", err)
 			}
 
-			dbConfig.Net = "cloudsqlconn"
+			dbConfig.Net = network
 			dbConfig.Addr = "localhost:3306"
 		}
 	}
@@ -228,13 +220,13 @@ func initDB(readOnly bool) *sql.DB {
 	return db
 }
 
-func registerDial(cloudSqlInstances string) error {
+func registerDial(cloudSqlInstances, network string) error {
 	dialer, err := cloudsqlconn.NewDialer(context.Background())
 	if err != nil {
 		return err
 	}
 
-	mysql.RegisterDialContext("cloudsqlconn", func(ctx context.Context, addr string) (net.Conn, error) {
+	mysql.RegisterDialContext(network, func(ctx context.Context, addr string) (net.Conn, error) {
 		return dialer.Dial(ctx, cloudSqlInstances)
 	})
 
@@ -250,24 +242,17 @@ func registerDial(cloudSqlInstances string) error {
 //   - Graceful shutdown in long-lived services
 //   - Manual cleanup between runs (e.g., CLI tools or dev scripts)
 func CloseDB() error {
-	if db != nil {
-		if err := db.Close(); err != nil {
-			return err
-		}
-		db = nil
+	if err := readDBOnce().Close(); err != nil {
+		return err
 	}
-
-	if wdb != nil {
-		if err := wdb.Close(); err != nil {
-			return err
-		}
-		wdb = nil
+	if err := writeDBOnce().Close(); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-func GenerateQueryString(query string, args []interface{}) string {
+func GenerateQueryString(query string, args []any) string {
 	if len(args) == 0 {
 		return query
 	}
@@ -284,10 +269,10 @@ func GenerateQueryString(query string, args []interface{}) string {
 	return GenerateQueryString(query, args[1:])
 }
 
-func resultToMap(list *sql.Rows) map[string]interface{} {
-	fields, _ := list.Columns()               // fieldName
-	scans := make([]interface{}, len(fields)) // value
-	row := make(map[string]interface{})       // result
+func resultToMap(list *sql.Rows) map[string]any {
+	fields, _ := list.Columns()       // fieldName
+	scans := make([]any, len(fields)) // value
+	row := make(map[string]any)       // result
 
 	for i := range scans {
 		scans[i] = &scans[i]
@@ -302,101 +287,25 @@ func resultToMap(list *sql.Rows) map[string]interface{} {
 	return row
 }
 
-func mapToStruct(data map[string]interface{}, target interface{}) {
-	rt := reflect.TypeOf(target).Elem()
-	rv := reflect.ValueOf(target).Elem()
-
-	for i := 0; i < rt.NumField(); i++ {
-		fieldName := rt.Field(i).Name
-		fieldType := rt.Field(i).Type
-		createdAtField, _ := rt.FieldByName(fieldName)
-		jsonTag := createdAtField.Tag.Get("json")
-
-		if jsonTag != "" {
-			fieldName = jsonTag
-		} else {
-			fieldName = strings.ToLower(fieldName)
-		}
-
-		if value, ok := data[fieldName]; ok {
-			value = typeConvertor(value, fieldType)
-
-			if fieldType.Kind() == reflect.Ptr && value != nil {
-				switch fieldType.Elem().Kind() {
-				case reflect.Bool:
-					tmp := false
-					rv.Field(i).Set(reflect.ValueOf(&tmp))
-					rv.Field(i).Elem().Set(reflect.ValueOf(value))
-				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-					tmp := 0
-					rv.Field(i).Set(reflect.ValueOf(&tmp))
-					rv.Field(i).Elem().Set(reflect.ValueOf(value))
-				case reflect.Float32, reflect.Float64:
-					tmp := 0.0
-					rv.Field(i).Set(reflect.ValueOf(&tmp))
-					rv.Field(i).Elem().Set(reflect.ValueOf(value))
-				case reflect.String:
-					tmp := ""
-					rv.Field(i).Set(reflect.ValueOf(&tmp))
-					rv.Field(i).Elem().Set(reflect.ValueOf(value))
-				case reflect.Map:
-					tmp := map[string]interface{}{}
-					rv.Field(i).Set(reflect.ValueOf(&tmp))
-					rv.Field(i).Elem().Set(reflect.ValueOf(value))
-				}
-			} else {
-				rv.Field(i).Set(reflect.ValueOf(value))
-			}
-		}
-	}
-}
-func typeConvertor(value interface{}, targetType reflect.Type) interface{} {
-	if targetType == nil {
-		return value
-	}
-
-	if targetType.Kind() == reflect.Ptr {
-		if value == "" {
-			return nil
-		}
-
-		targetType = targetType.Elem()
-	}
-
-	switch targetType.Kind() {
-	case reflect.Bool:
-		return cast.ToBool(value)
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return cast.ToInt(cast.ToString(value))
-	case reflect.Float32, reflect.Float64:
-		return cast.ToFloat64(cast.ToString(value))
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return cast.ToUint(value)
-	case reflect.String:
-		return cast.ToString(value)
-	case reflect.Map:
-		return cast.ToStringMap(value)
-	case reflect.Struct:
-		switch targetType {
-		case reflect.TypeOf(time.Time{}):
-			return cast.ToTime(value)
-		}
-	}
-
-	return value
+type fieldMap struct {
+	structIdx int
+	scanIdx   int
 }
 
 func ScanStruct[T any](row *sql.Rows) (structData T) {
-	fields, _ := row.Columns()                // fieldName
-	scans := make([]interface{}, len(fields)) // value
+	fields, _ := row.Columns()        // fieldName
+	scans := make([]any, len(fields)) // value
 
 	for i := range scans {
-		scans[i] = new(interface{})
+		scans[i] = new(any)
 	}
 
 	rt := reflect.TypeOf(structData)
 	rv := reflect.ValueOf(&structData).Elem()
-	for i := 0; i < rt.NumField(); i++ {
+	numFields := rt.NumField()
+
+	notNullFields := make([]fieldMap, 0, rt.NumField())
+	for i := range numFields {
 		field := rt.Field(i)
 		fieldName := field.Name
 
@@ -408,7 +317,7 @@ func ScanStruct[T any](row *sql.Rows) (structData T) {
 			fieldName = strcase.ToSnake(fieldName)
 		}
 
-		idx := IndexOf(fieldName, fields)
+		idx := slices.Index(fields, fieldName)
 		if idx < 0 {
 			continue
 		}
@@ -416,6 +325,8 @@ func ScanStruct[T any](row *sql.Rows) (structData T) {
 		// Only set the scan target if the field type can handle nil
 		if isNullableType(field.Type) {
 			scans[idx] = rv.Field(i).Addr().Interface()
+		} else {
+			notNullFields = append(notNullFields, fieldMap{i, idx})
 		}
 	}
 
@@ -426,30 +337,14 @@ func ScanStruct[T any](row *sql.Rows) (structData T) {
 	}
 
 	// For fields we didn't set (because they might error), try to set them from the scanned interface{}
-	for i := 0; i < rt.NumField(); i++ {
-		field := rt.Field(i)
-		fieldName := field.Name
-
-		if jsonTag := field.Tag.Get("json"); jsonTag != "" {
-			fieldName = jsonTag
-		} else {
-			fieldName = strcase.ToSnake(fieldName)
-		}
-
-		idx := IndexOf(fieldName, fields)
-		if idx < 0 {
-			continue
-		}
-
-		if !isNullableType(field.Type) {
-			// Try to set the value from the scanned interface{}
-			scannedVal := *scans[idx].(*interface{})
-			if scannedVal != nil {
-				fv := rv.Field(i)
-				if err := setFieldFromInterface(fv, scannedVal); err != nil {
-					// Skip if we can't set the field
-					continue
-				}
+	for _, m := range notNullFields {
+		// Try to set the value from the scanned any
+		scannedVal := *scans[m.scanIdx].(*any)
+		if scannedVal != nil {
+			fv := rv.Field(m.structIdx)
+			if err := setFieldFromInterface(fv, scannedVal); err != nil {
+				// Skip if we can't set the field
+				continue
 			}
 		}
 	}
@@ -460,7 +355,7 @@ func ScanStruct[T any](row *sql.Rows) (structData T) {
 // Helper function to check if a type can handle nil values
 func isNullableType(t reflect.Type) bool {
 	switch t.Kind() {
-	case reflect.Ptr, reflect.Interface, reflect.Slice, reflect.Map:
+	case reflect.Pointer, reflect.Interface, reflect.Slice, reflect.Map:
 		return true
 	default:
 		// Check for sql.Null types
@@ -472,7 +367,7 @@ func isNullableType(t reflect.Type) bool {
 }
 
 // Helper function to set a field from an interface{} value
-func setFieldFromInterface(fv reflect.Value, val interface{}) error {
+func setFieldFromInterface(fv reflect.Value, val any) error {
 	if !fv.CanSet() {
 		return fmt.Errorf("field cannot be set")
 	}
